@@ -4,7 +4,7 @@
 [![license](https://img.shields.io/github/license/mashape/apistatus.svg)](/LICENSE)
 [![size](https://img.shields.io/github/size/webcaetano/craft/build/phaser-craft.min.js.svg)]()
 
-CountMappedReads counts mapped reads and calculates FPKM. For read mapping, bowtie2 is used.
+CountMappedReads maps NGS reads on given reference sequences (by using bowtie2), then counts mapped reads and calculates FPKM.
 
 ## requirements
 * bowtie2 (ver < 2.3.0)
