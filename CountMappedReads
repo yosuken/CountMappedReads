@@ -1,0 +1,276 @@
+#!/bin/bash
+#
+#  CountMappedReads - an in-house script for FPKM calculation
+#
+#    Copyright: 2017 (C) Yosuke Nishimura (yosuke@kuicr.kyoto-u.ac.jp)
+#    License: MIT license
+#    Initial version: 2017-03-03
+#
+
+PROGNAME=$(basename $0)
+VERSION="1.0"
+PROGNAMEc="[35m$PROGNAME[0m"
+Errmsg="[31m[error][0m"
+CMD=($0 $*)
+
+
+# {{{ usage
+read -r -d '' usage <<EOF
+[35m### $PROGNAME ver $VERSION ###[0m
+
+[32m[description][0m
+$PROGNAME maps NGS reads on given reference sequences (by using bowtie2), then counts mapped reads and calculates FPKM.
+
+[32m[usage][0m
+$ $PROGNAME <reference fasta> <output dir> {-1 <pe1> -2 <pe2> | -U <up>} [options]
+
+[32m[arguments][0m
+    - reference fasta      -- nucleotide fasta file for mapping/couting (e.g. genomes, contigs, genes)
+    - output dir           -- output directory
+
+[32m[dependencies][0m
+    - bowtie2 (ver < 2.3)
+    - samtools
+    - ruby (ver >=2.0) 
+
+[32m[options][0m
+  (general)
+    -h, --help
+    -v, --version
+
+  (bowtie2)
+    -1            [str] (required)    -- bowtie2 '-1' option (paired-end read 1)
+    -2            [str] (required)    -- bowtie2 '-2' option (paired-end read 2)
+    -U            [str] (required)    -- bowtie2 '-U' option (unpaired reads)
+    --end-to-end        (default)     -- If specified, bowtie2 is run in 'end-to-end' alignment mode.
+    --local                           -- If specified, bowtie2 is run in 'local' alignment mode.
+    --score-min   [str]               -- bowtie2 '--score-min' option (default: 'L,0,-0.6' for 'end-to-end' mode, 'L,0,0.6' for 'local' mode)
+
+  (computation)
+    --threads     [int] (default: 1)  -- number of threads for run of bowtie2 and samtools
+    --mem         [str] (default: 1G) -- maximum memory per thread for 'samtools sort'; suffix K/M/G is recognized (e.g., 800M)
+
+
+[32m[output files][0m
+result/count-FPKM.tsv                 -- tab separated file (1: seq ID, 2: seq length, 3: FPKM, 4: mapped read count, 5: mapping type)
+
+[32m[note][0m
+The '--score-min' option of bowtie2 controls a minimum acceptable level of mapping quality.
+For example, with the 'end-to-end' mode, '--score-min L,0,-0.6' means an aligned region shows at least 90% identity, assuming that a read quality is high enough and a gap is not open.
+Similarity, 'L,0,-0.3' means at least 95% identity, 'L,0,-0.9' means at least 85% identity, and 'L,0,-1.2' means at least 80% identity under the same assumption.
+For deteils of the '--score-min' option and the alignment score, see bowtie2 manual page (http://bowtie-bio.sourceforge.net/bowtie2/manual.shtml).
+
+If reference sequences are genes (rather than genomes), it might be appropriate to use bowtie2 'local' mode, considering a situation that only a part of a read is overlapping with a gene.
+When calculation is performed by the 'local' mode, this tool performs a post-filtering process on the bowtie2 mapping, defined by two criteria (as follows) that cannot be adjusted by a user.
+(1) Aligned length must be at least 50nt AND at least 0.5 * read length.
+(2) Alignment score must be at least 1.2 * alignment length (i.e., suppose a read quality is high enough and a gap is not open, an aligned region shows at least 90% identity).
+For the 'end-to-end' mode, no post-filtering process is performed (that is, the criteria above is not applied).
+EOF
+# }}} usage
+
+
+# {{{ parse command line
+for OPT in "$@"
+do
+	case "$OPT" in
+		'-h'|'--help' )
+			echo "$usage"
+			exit 1
+			;;
+		'-v'|'--version' )
+			echo $VERSION
+			exit 1
+			;;
+		'-1' )
+			if [[ -z "$2" ]] || [[ "$2" =~ ^-+ ]] ; then
+				echo "$Errmsg option requires an argument -- $1" 1>&2
+				exit 1
+			fi
+			pe1="$2"
+			shift 2
+			;;
+		'-2' )
+			if [[ -z "$2" ]] || [[ "$2" =~ ^-+ ]] ; then
+				echo "$Errmsg option requires an argument -- $1" 1>&2
+				exit 1
+			fi
+			pe2="$2"
+			shift 2
+			;;
+		'-U' )
+			if [[ -z "$2" ]] || [[ "$2" =~ ^-+ ]] ; then
+				echo "$Errmsg option requires an argument -- $1" 1>&2
+				exit 1
+			fi
+			up="$2"
+			shift 2
+			;;
+		'--end-to-end' )
+			if [[ -n "$mapping" ]] ; then
+				echo "$Errmsg either of '--end-to-end'/'--local' can be selected  -- $1" 1>&2
+				exit 1
+			else
+				mapping='end-to-end'
+				shift 1
+			fi
+			;;
+		'--local' )
+			if [[ -n "$mapping" ]] ; then
+				echo "$Errmsg either of '--end-to-end'/'--local' can be selected  -- $1" 1>&2
+				exit 1
+			else
+				mapping='local'
+				shift 1
+			fi
+			;;
+		'--score-min' )
+			if [[ -z "$2" ]] || [[ "$2" =~ ^-+ ]] ; then
+				echo "$Errmsg option requires an argument -- $1" 1>&2
+				exit 1
+			fi
+			score_min="$2"
+			shift 2
+			;;
+		'--threads' )
+			if [[ -z "$2" ]] || [[ "$2" =~ ^-+ ]] ; then
+				echo "$Errmsg option requires an argument -- $1" 1>&2
+				exit 1
+			fi
+			threads="$2"
+			shift 2
+			;;
+		'--mem' )
+			if [[ -z "$2" ]] || [[ "$2" =~ ^-+ ]] ; then
+				echo "$Errmsg option requires an argument -- $1" 1>&2
+				exit 1
+			fi
+			mem="$2"
+			shift 2
+			;;
+		'--'|'-' )
+			shift 1
+			params+=( "$@" )
+			break
+			;;
+		-*)
+			echo "$Errmsg illegal option -- '$(echo $1 | sed 's/^-*//')'" 1>&2
+			exit 1
+			;;
+		*)
+			if [[ ! -z "$1" ]] && [[ ! "$1" =~ ^-+ ]] ; then
+				#params=( ${params[@]} "$1" )
+				params+=( "$1" )
+				shift 1
+			fi
+			;;
+	esac
+done
+if [ -z $params ] || [ ${#params[@]} -lt 2 ] ; then
+	echo "$Errmsg need 2 arguments" 1>&2
+	echo 
+	echo "$usage" 1>&2
+	exit 1
+elif ! [ -f "${params[0]}" ] ; then
+	echo "$Errmsg  the first argument should be a fasta file." 1>&2
+	echo 
+	echo "$usage" 1>&2
+	exit 1
+elif [ -e "${params[1]}" ] ; then
+	echo "$Errmsg  output directory is already exist." 1>&2
+	echo 
+	echo "$usage" 1>&2
+	exit 1
+fi
+if [[ -z $pe1 ]] && [[ -z $se ]] ; then
+	echo "$Errmsg specify read file(s) by ('-1 <pe1> -2 <pe2>' and/or '-U <up>')" 1>&2
+	echo 
+	echo "$usage" 1>&2
+	exit 1
+fi
+if [[ -n $pe1 ]] && [[ -z $pe2 ]] ; then
+	echo "$Errmsg specify two files of paired-end reads by '-1 <pe1> -2 <pe2>'" 1>&2
+	echo 
+	echo "$usage" 1>&2
+	exit 1
+fi
+if [[ -z $pe1 ]] && [[ -n $pe2 ]] ; then
+	echo "$Errmsg specify two files of paired-end reads by '-1 <pe1> -2 <pe2>'" 1>&2
+	echo 
+	echo "$usage" 1>&2
+	exit 1
+fi
+# }}} parse command line
+
+
+# {{{ check dependencies
+### check availablity of bowtie2
+command -v bowtie2 >/dev/null 2>&1 || { echo >&2 "$Errmsg bowtie2 is required but not available.  Aborting."; exit 1; }
+ST=`bowtie2 --version 2>/dev/null |head -n 1 |ruby -e 'v=$stdin.read.strip.split[-1]; print (v >= "2.3" ? 1 : 0)'`
+if [ $ST -ne 0 ]; then 
+	echo >&2 "$Errmsg bowtie2 (version < 2.3.0) is required.  Aborting."; exit 1;
+fi
+
+### check availablity of samtools
+command -v samtools >/dev/null 2>&1 || { echo >&2 "$Errmsg samtools is required but not available.  Aborting."; exit 1; }
+
+### check ruby version
+ST=`ruby -e 'print RUBY_VERSION >= "2.0" ? 0 : 1'`
+if [ $ST -ne 0 ]; then 
+	echo >&2 "$Errmsg ruby (version >=2.0) is required.  Aborting."; exit 1;
+fi
+
+### check availablity of GNU parallel
+if [ -n $ncpus ]; then 
+	command -v parallel >/dev/null 2>&1 || { echo >&2 "$Errmsg GNU parallel is required but not available.  Aborting."; exit 1; }
+fi
+# }}} check dependencies
+
+
+# {{{ assign variables 
+### parse args
+fin="${params[0]}"
+dir="${params[1]}"
+
+### bowtie2 params
+pe1="${pe1}"
+pe2="${pe2}"
+up="${up}"
+mapping="${mapping:-end-to-end}"
+score_min="${score_min}"
+
+### computation params
+threads="${threads:-1}"
+mem="${mem:-1G}"
+
+### rakefile/logdir
+pushd `dirname $0` > /dev/null
+scrdir=`pwd -P`
+popd > /dev/null
+jobname=`basename $0`
+rakefile=$scrdir/$jobname.rake
+logdir=$dir/log
+# }}} assign variables 
+
+
+### log input command / bowtie2 version
+mkdir -p $logdir
+echo "###############"    > $logdir/$jobname.log
+echo "[input command]"    > $logdir/$jobname.log
+echo "$CMD"              >> $logdir/$jobname.log
+echo "[bowtie2 version]" >> $logdir/$jobname.log
+bowtie2 --version        >> $logdir/$jobname.log
+echo "###############"    > $logdir/$jobname.log
+
+### run
+if [ -d $logdir ]; then
+	rake -f $rakefile fin="$fin" dir="$dir" pe1="$pe1" pe2="$pe2" up="$up" mapping="$mapping" score_min="$score_min" threads="$threads" mem="$mem" \
+		2>&1 |tee -a $logdir/$jobname.log
+fi
+
+### after run
+if [[ "${PIPESTATUS[0]}" -gt 0 ]] || [[ "${PIPESTATUS[1]}" -gt 0 ]] ; then 
+	echo "$Errmsg calculation failed: $(LC_ALL=C date +'%Y-%m-%d %H:%M:%S %z')" > $logdir/error
+	exit 1
+else
+	echo "[success] calculation finished: $(LC_ALL=C date +'%Y-%m-%d %H:%M:%S %z')" > $logdir/success
+fi
